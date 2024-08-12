@@ -1,0 +1,133 @@
+import sys
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, when, avg, count, desc, lag
+from pyspark.sql.window import Window
+
+# Initialize AWS Glue arguments
+args = getResolvedOptions(sys.argv, ['JOB_NAME'])
+
+# Initialize the GlueContext
+glueContext = GlueContext(SparkSession.builder.getOrCreate())
+spark = glueContext.spark_session
+
+# Initialize the Glue Job
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+
+# Load data from S3
+df = spark.read.csv("s3://electricvehiclesrawdata/raw-data/Electric_Vehicle_Population_Data.csv", header=True, inferSchema=True)
+
+# Check initial schema
+print("Initial Schema:")
+df.printSchema()
+
+# Sample data
+print("Sample Data:")
+df.show(5)
+
+# Filter data: Keep only records from 2020 onwards
+df_filtered = df.filter(col("Model Year") >= 2020)
+
+# Data Cleaning: Fill missing 'Vehicle Location' with 'Unknown'
+df_cleaned = df_filtered.withColumn("Vehicle Location", when(col("Vehicle Location").isNull(), "Unknown").otherwise(col("Vehicle Location")))
+
+# Fill missing numeric values with median
+numeric_cols = [col_name for col_name, dtype in df_cleaned.dtypes if dtype in ('int', 'double', 'float')]
+for col_name in numeric_cols:
+    median = df_cleaned.approxQuantile(col_name, [0.5], 0.0)[0]
+    df_cleaned = df_cleaned.withColumn(col_name, when(col(col_name).isNull(), median).otherwise(col(col_name)))
+
+# Remove duplicates based on VIN (1-10)
+df_cleaned = df_cleaned.dropDuplicates(["VIN (1-10)"])
+
+# Column Operations: Rename column, drop column, and add new column
+df_renamed = df_cleaned.withColumnRenamed("EVModel", "Model")
+df_dropped = df_renamed.drop("DOL Vehicle ID")
+df_with_age = df_dropped.withColumn("Age", 2024 - col("Model Year"))
+
+# Feature Engineering: Create VehicleAgeCategory based on Age
+df_with_age_category = df_with_age.withColumn(
+    "VehicleAgeCategory",
+    when(col("Age") <= 1, "New").when((col("Age") > 1) & (col("Age") <= 3), "Recent").otherwise("Old")
+)
+
+# Transformation 1: Total Sales by Year and Make
+df_sales_by_year_make = df_with_age_category.groupBy("Model Year", "Make").agg(count("*").alias("Total Sales"))
+
+# Verify the columns
+print("df_sales_by_year_make Schema:")
+df_sales_by_year_make.printSchema()
+
+# Ensure 'Total Sales' exists
+df_sales_by_year_make.show()
+
+# Join Total Sales back to the main DataFrame
+df_with_age_category = df_with_age_category.join(
+    df_sales_by_year_make,
+    on=["Model Year", "Make"],
+    how="left"
+)
+
+# Verify df_with_age_category Schema and Data
+print("df_with_age_category Schema after joining Total Sales:")
+df_with_age_category.printSchema()
+df_with_age_category.show()
+
+# Transformation 3: Sales by Vehicle Type
+if 'Electric Vehicle Type' in df_with_age_category.columns:
+    df_sales_by_type = df_with_age_category.groupBy("Electric Vehicle Type").agg(count("*").alias("Sales by Type"))
+    df_with_age_category = df_with_age_category.join(df_sales_by_type, on='Electric Vehicle Type', how='left')
+
+# Transformation 4: Most Popular Models
+df_most_popular_models = df_with_age_category.groupBy("Model").agg(count("*").alias("Total Model Sales")).orderBy(desc("Total Model Sales")).limit(5)
+
+# Transformation 5: Market Share by Make
+total_sales = df_with_age_category.count()
+df_market_share = df_with_age_category.groupBy("Make").agg((count("*") / total_sales * 100).alias("Market Share (%)"))
+df_with_age_category = df_with_age_category.join(df_market_share, on='Make', how='left')
+
+# Transformation 6: Growth Rate Calculation
+window_spec = Window.partitionBy("Make").orderBy("Model Year")
+df_with_growth_rate = df_sales_by_year_make.withColumn(
+    "Previous Year Sales",
+    lag("Total Sales").over(window_spec)
+).withColumn(
+    "Growth Rate (%)",
+    ((col("Total Sales") - col("Previous Year Sales")) / col("Previous Year Sales") * 100)
+)
+
+# Ensure 'Growth Rate (%)' column is present
+df_with_growth_rate.show()
+
+df_with_age_category = df_with_age_category.join(df_with_growth_rate.select("Model Year", "Make", "Growth Rate (%)"), on=["Model Year", "Make"], how="left")
+
+# Compile all transformations into final DataFrame
+df_final = df_with_age_category.select(
+    "Make", "Model", "Model Year", "Vehicle Location", "Age",
+    "Total Sales", "Sales by Type", "Market Share (%)", "Growth Rate (%)"
+)
+
+# Convert back to DynamicFrame for Glue
+transformed_data = DynamicFrame.fromDF(df_final, glueContext, "transformed_data")
+
+# Write transformed data to S3
+glueContext.write_dynamic_frame.from_options(
+    frame=transformed_data,
+    connection_type="s3",
+    connection_options={
+        "path": "s3://electricvehiclestransformeddata9/"
+    },
+    format="csv",
+    format_options={
+        "separator": ",",
+        "quoteChar": '"',
+        "writeHeader": True
+    }
+)
+
+
