@@ -1,0 +1,47 @@
+import sys
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+
+# Initialize Glue context and job
+args = getResolvedOptions(sys.argv, ['JOB_NAME'])
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+
+# Load data from a single Glue Data Catalog table
+input_dynamic_frame = glueContext.create_dynamic_frame.from_catalog(
+    database="electric_vehicles_database1",
+    table_name="electric_vehicles_sales_data"
+)
+
+# Convert to DataFrame
+input_df = input_dynamic_frame.toDF()
+
+# Apply a basic transformation: Rename a column
+transformed_df = input_df.withColumnRenamed('transaction id', 'transaction_identifier')
+
+# Convert back to DynamicFrame
+transformed_dynamic_frame = DynamicFrame.fromDF(transformed_df, glueContext, "transformed_dynamic_frame")
+
+# Write transformed data to S3
+glueContext.write_dynamic_frame.from_options(
+    frame=transformed_dynamic_frame,
+    connection_type="s3",
+    connection_options={
+        "path": "s3://electricvehiclestransformeddata/"
+    },
+    format="csv",
+    format_options={
+        "separator": ",",
+        "quoteChar": '"',
+        "writeHeader": True
+    }
+)
+
+job.commit()
+e code petandi  new code for the ETL ani petandi pata code
